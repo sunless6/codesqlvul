@@ -1,0 +1,234 @@
+import logging
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+TELEGRAM_BOT_TOKEN = "8199075206:AAEmKVayIpljBVVcP8QkEdZggUQ-dmYJhgk"
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+async def char_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pending_character_upload.add(chat_id)
+    await update.message.reply_text("Пожалуйста, отправьте .png-файл (или .json) с карточкой персонажа SillyTavern/JanitorAI/TavernAI/NovelAI.")
+
+async def handle_character_png(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    pending_character_upload.discard(chat_id)
+    document = update.message.document
+    if not document or not (document.file_name.lower().endswith('.png') or document.file_name.lower().endswith('.json')):
+        await update.message.reply_text("Пожалуйста, отправьте .png- или .json-файл с карточкой персонажа.")
+        return
+    file = await document.get_file()
+    byte_data = await file.download_as_bytearray()
+    if document.file_name.lower().endswith('.json'):
+        import json
+        try:
+            char_json = json.loads(byte_data.decode())
+        except Exception:
+            await update.message.reply_text("Ошибка чтения или разбора .json-файла карточки.")
+            return
+    else:
+        char_json = extract_character_json_from_png_bytes(byte_data)
+        if not char_json:
+            await update.message.reply_text("Не удалось найти данные персонажа в .png.")
+            return
+        if isinstance(char_json, str):
+            import json
+            try:
+                char_json = json.loads(char_json)
+            except Exception:
+                await update.message.reply_text("Ошибка парсинга данных персонажа.")
+                return
+    character_data[chat_id] = char_json
+    clear_memory(chat_id)
+    char_name = char_json.get('name', 'Персонаж')
+    greeting = get_character_first_message(char_json)
+    await update.message.reply_text(f"Персонаж загружен: {char_name}\n\nПервое сообщение:\n{greeting}")
+    mem = get_chat_memory(chat_id)
+    if greeting:
+        mem['shortterm'].append({'user': char_name, 'text': greeting})
+
+async def config_upload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upload_waiting.add(update.effective_chat.id)
+    await update.message.reply_text("Пожалуйста, отправьте .json файл-конфиг SillyTavern (прикрепите его документом).")
+
+async def handle_config_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    upload_waiting.discard(chat_id)
+    document = update.message.document
+    if not document or not document.file_name.lower().endswith('.json'):
+        await update.message.reply_text("Пожалуйста, отправьте файл .json с конфигурацией.")
+        return
+    try:
+        file = await document.get_file()
+        content = await file.download_as_bytearray()
+        import json
+        config = json.loads(content.decode())
+        save_config(chat_id, config)
+        chat_configs[chat_id] = config
+        await update.message.reply_text("Конфиг успешно загружен!")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки конфига: {e}")
+        await update.message.reply_text("Ошибка чтения/разбора файла конфига.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in upload_waiting:
+        await handle_config_upload(update, context)
+        return
+    if chat_id in pending_character_upload:
+        await handle_character_png(update, context)
+        return
+    await update.message.reply_text("Документ не принят. Используйте /char или /config перед отправкой файла.")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Это AI-чат!!! Ну типа как SillyTaven, да?!\n"
+        "/config — загрузить SillyTavern .json-конфиг\n"
+        "/char — загрузить персонажа (.png/.json)\n"
+        "/setuser <имя> — кастомное имя пользователя\n"
+        "/clear — очистить память\n"
+        "/ltm — показать long-term memory\n"
+        "/ltm_clear — очистить long-term memory\n"
+        "/set_gemini_api <API_KEY> — установить свой ключ Gemini API"
+    )
+
+async def set_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /setuser <имя>")
+        return
+    user_name = " ".join(args)
+    user_custom_names[chat_id] = user_name
+    await update.message.reply_text(f"Теперь ваше имя для {{user}}: {user_name}")
+
+async def set_gemini_api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Используйте: /set_gemini_api <API_KEY>")
+        return
+    api_key = args[0]
+    set_gemini_api_key(api_key)
+    await update.message.reply_text("Ключ Gemini API успешно установлен и сохранён.")
+
+async def clear_memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    clear_memory(chat_id)
+    character_data.pop(chat_id, None)
+    pending_character_upload.discard(chat_id)
+    upload_waiting.discard(chat_id)
+    await update.message.reply_text("Память чата, персонаж и long-term memory очищены.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_name = user_custom_names.get(chat_id) or update.effective_user.first_name or "user"
+    text = update.message.text
+
+    if text.startswith("/") and not text.lower().startswith("/resend"):
+        return
+
+    append_message_to_memory(chat_id, update.message.message_id, user_name, text)
+    config = chat_configs.get(chat_id) or load_config(chat_id)
+    if not config:
+        await update.message.reply_text("Сначала загрузите SillyTavern-конфиг через /config.")
+        return
+    char_name = character_data.get(chat_id, {}).get('name', None)
+
+    system_instruction = build_system_instruction(config, char_name=char_name, user_name=user_name)
+    contents = build_context_for_gemini(chat_id, user_name, text, config, char_name)
+    await update.message.chat.send_action("typing")
+    answer = call_gemini_api(contents=contents, config=config, system_instruction=system_instruction, user_name=user_name)
+    botmsg = await update.message.reply_text(answer)
+    last_bot_message[chat_id] = botmsg.message_id
+
+    mem = get_chat_memory(chat_id)
+    mem['shortterm'].append({'user': char_name or "AI", 'text': answer})
+    if len(mem['shortterm']) > memory_cfg.SHORT_TERM_DEPTH:
+        mem['shortterm'].pop(0)
+
+async def resend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_name = user_custom_names.get(chat_id) or update.effective_user.first_name or "user"
+    config = chat_configs.get(chat_id) or load_config(chat_id)
+    if not config:
+        return
+
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.warning(f"Failed to delete /resend command: {e}")
+
+    mem = get_chat_memory(chat_id)
+    st = mem['shortterm']
+
+    last_user_text = None
+    for idx in range(len(st)-1, -1, -1):
+        if st[idx]['user'] == user_name:
+            last_user_text = st[idx]['text']
+            break
+    if not last_user_text:
+        return
+
+    char_name = character_data.get(chat_id, {}).get('name', None)
+    system_instruction = build_system_instruction(config, char_name=char_name, user_name=user_name)
+    contents = build_context_for_gemini(chat_id, user_name, last_user_text, config, char_name)
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+    answer = call_gemini_api(contents=contents, config=config, system_instruction=system_instruction, user_name=user_name)
+
+    update_last_bot_message_in_memory(chat_id, char_name or "AI", answer)
+    update_last_bot_message_in_longterm(chat_id, answer)
+
+    bot_msg_id = last_bot_message.get(chat_id)
+    if bot_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=bot_msg_id,
+                text=answer
+            )
+        except Exception as e:
+            logger.warning(f"Failed to edit last bot message: {e}")
+
+async def show_ltm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mem = get_chat_memory(chat_id)
+    ltm = mem['longterm']
+    if not ltm:
+        await update.message.reply_text("Long-term memory пуста.")
+        return
+    text = "\n\n---\n\n".join(ltm[-5:])
+    await update.message.reply_text(f"Последние записи long-term memory:\n\n{text}")
+
+async def clear_ltm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    mem = get_chat_memory(chat_id)
+    mem['longterm'] = []
+    await update.message.reply_text("Long-term memory очищена.")
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("config", config_upload_cmd))
+    app.add_handler(CommandHandler("char", char_cmd))
+    app.add_handler(CommandHandler("setuser", set_user_cmd))
+    app.add_handler(CommandHandler("clear", clear_memory_cmd))
+    app.add_handler(CommandHandler("ltm", show_ltm))
+    app.add_handler(CommandHandler("ltm_clear", clear_ltm_cmd))
+    app.add_handler(CommandHandler("resend", resend_cmd))
+    app.add_handler(CommandHandler("set_gemini_api", set_gemini_api_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
