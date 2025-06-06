@@ -1,0 +1,20 @@
+class Storage:
+    def __init__(self, path):
+        self.path = path              # Сохраняет путь к файлу, в котором будут храниться данные
+        self.data = None              # Переменная для хранения данных, загруженных из файла
+
+    def exists(self):
+        return os.path.exists(self.path)  # Проверяет, существует ли файл по заданному пути
+
+    def load(self):
+        with open(self.path, "rb") as f: # Открывает файл в бинарном режиме для чтения
+            self.data = f.read()         # Загружает все содержимое файла в self.data
+
+    def save(self, raw_data: bytes):
+        with open(self.path, "wb") as f: # Открывает файл в бинарном режиме для записи
+            f.write(raw_data)            # Записывает переданные данные в файл
+        try:
+            if os.name == "posix":       # Если операционная система POSIX (Linux, MacOS и др.)
+                os.chmod(self.path, 0o600) # Устанавливает права доступа "только для владельца": чтение и запись
+        except Exception:
+            pass                        # Игнорирует любые ошибки при смене прав доступа
